@@ -1,0 +1,8 @@
+streamlit
+matplotlib
+httpx
+python-dotenv
+openai
+Pillow
+numpy
+sgfmill==1.1.1
