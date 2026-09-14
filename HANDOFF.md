@@ -1,3 +1,48 @@
+# Streamlit 原型迁移（2026-09-15，已完成）
+
+## 实现状态
+
+静态 `html/` 仅作为布局与交互参考，未复制其中的演示数据，也未纳入提交。应用现使用
+Streamlit 原生 `st.navigation` 提供首页、新建复盘 / SGF复盘、错题本、成长看板四个页面。
+主题采用克制的“暮色梅影”配色，复盘页在 1366×768 下优先保留棋盘、KataGo Evidence
+和 LLM 区域；原型中的虚构 LLM 文本被明确的未接入状态替代。
+
+调用关系保持后端边界：
+
+`app.py` → `app_pages/*` → 既有 `sgf_ingestion` / `KataGoAdapter` / `analyzer` /
+`memory_store`。UI 不解析 KataGo 原始 JSON，也不包含 subprocess 细节。快速/深度模式只改变
+当前单局面的 `max_visits`（150/500），没有引入 persistent engine、全盘扫描或 Agent。
+
+- 图片入口继续使用真实图片识别、手动棋盘确认、GPT 快速/深度点评、embedding 检索与
+  SQLite 保存流程。
+- SGF 入口继续使用真实 SGF → Position → LocalKataGoAdapter → AnalysisResult，支持选手数，
+  展示胜率、目差、visits、推荐着、候选着和 PV；改变棋谱、手数或模式会清除旧结果。
+- 错题本读取既有 SQLite 数据，选中项行内展开；有选中项时其余记录弱化。新增的读取函数
+  不加载 embedding、不修改 schema。
+- 成长看板只聚合 SQLite 的真实记录；无数据时显示空状态，不生成演示趋势。
+- SGF 的“加入错题本”保持禁用并说明原因：当前 schema/流程保存的是 GPT 结构化错误及
+  embedding，不能把 KataGo 数值伪装成同类记录。本阶段没有越界实现 Evidence → LLM 或
+  事件级 Memory。
+
+## 验证
+
+- `pytest -q`: **56 passed, 3 skipped**（真机与浏览器测试默认可选）。
+- `RUN_KATAGO_INTEGRATION=1 pytest -q -s -m integration`: **2 passed**。
+  - move 2: winrate 0.976054835，score lead +3.45561815，best F5，visits 504。
+  - move 4: winrate 0.998088001，score lead +9.34530935，best F5，visits 504。
+- 真实 Edge / Streamlit / KataGo 浏览器 E2E：**1 passed**；覆盖四页导航、SGF 上传、
+  move 2 / move 4、真实 150 visits 分析和 LLM 区域可见性。
+- AppTest 覆盖图片识别、手动确认、GPT 两阶段调用、SQLite 新增/读取、两条错题的行内展开、
+  看板真实聚合、KataGo 快速/深度参数和失败状态。
+- `compileall` 与 `git diff --check` 通过；未调用真实 OpenAI 服务。
+
+## 下一步
+
+实现同一 `KataGoAdapter` 协议下的 `PersistentKataGoAdapter`，先处理进程生命周期、query id、
+响应匹配与关闭，再复用现有 Position / AnalysisResult 和真机测试。不要同时开始全盘扫描。
+
+---
+
 # 真实 KataGo 接入（2026-09-14，当前阶段）
 
 ## 方向与范围

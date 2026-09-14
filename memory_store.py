@@ -90,6 +90,28 @@ def load_history():
     return [dict(row) for row in rows]
 
 
+def load_mistake_records():
+    """读取错题本展示字段；不加载 embedding，也不改变存储 schema。"""
+    with _connect() as connection:
+        games = connection.execute(
+            """SELECT id, created_at, board_size, user_color, board_json,
+                      high_commentary, position_summary, count_json
+               FROM games ORDER BY id DESC"""
+        ).fetchall()
+        result = []
+        for game in games:
+            issues = connection.execute(
+                """SELECT issue_type, region, severity, evidence, improvement
+                   FROM issues WHERE game_id = ? ORDER BY id""", (game["id"],)
+            ).fetchall()
+            item = dict(game)
+            item["board_data"] = json.loads(item.pop("board_json"))
+            item["count_estimate"] = json.loads(item.pop("count_json"))
+            item["issues"] = [dict(issue) for issue in issues]
+            result.append(item)
+    return result
+
+
 def find_most_similar(game_vector, issues, board_size):
     """同棋盘规格内检索；综合分为35%局面相似度+65%最佳错误相似度。"""
     with _connect() as connection:
