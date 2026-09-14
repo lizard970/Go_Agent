@@ -1,5 +1,6 @@
 import json
 import os
+from functools import lru_cache
 
 import httpx
 from dotenv import load_dotenv
@@ -7,10 +8,16 @@ from openai import OpenAI
 
 
 load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    http_client=httpx.Client(proxy="http://127.0.0.1:9567"),
-)
+
+
+@lru_cache(maxsize=1)
+def get_client():
+    """Create the LLM client only when an LLM feature is used."""
+    return OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        http_client=httpx.Client(proxy="http://127.0.0.1:9567"),
+    )
+
 
 GPT_MODEL = "gpt-5.6"
 EMBEDDING_MODEL = "text-embedding-3-small"
@@ -78,7 +85,7 @@ def analyze_with_gpt(board_data, factors, tone_choice, user_color, custom_prompt
 
 按“形势与盘面估算—具体证据—关键问题—改进建议”组织；毒舌风格可以自然连贯，但不能牺牲技术准确性。直接输出点评，不要开场白，控制在450字以内。"""
 
-    response = client.chat.completions.create(
+    response = get_client().chat.completions.create(
         model=GPT_MODEL,
         messages=[{"role": "user", "content": analysis_prompt}],
     )
@@ -158,7 +165,7 @@ def analyze_high_with_gpt(board_data, factors, tone_choice, user_color):
 
 只输出符合 schema 的结果。"""
 
-    response = client.chat.completions.create(
+    response = get_client().chat.completions.create(
         model=GPT_MODEL,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_schema", "json_schema": HIGH_ANALYSIS_SCHEMA},
@@ -178,7 +185,7 @@ def get_embeddings(texts):
     """批量生成 embedding；输入顺序与输出顺序一致。"""
     if not texts:
         return []
-    response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    response = get_client().embeddings.create(model=EMBEDDING_MODEL, input=texts)
     return [item.embedding for item in response.data]
 
 

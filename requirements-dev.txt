@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+# Only required for GO_REVIEW_E2E_URL browser checks; Edge/Chrome may be used.
+playwright>=1.50

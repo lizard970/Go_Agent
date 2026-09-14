@@ -3,13 +3,10 @@ import hashlib
 import copy
 import io
 import json
-import os
 
-import httpx
 import matplotlib.pyplot as plt
 import streamlit as st
 from dotenv import load_dotenv
-from openai import OpenAI
 from PIL import Image
 
 from analyzer import (
@@ -18,6 +15,7 @@ from analyzer import (
     analyze_with_gpt,
     build_embedding_texts,
     get_embeddings,
+    get_client,
 )
 from board_state import stones_to_grid, grid_to_stones
 from sgf_ingestion import parse_sgf
@@ -28,10 +26,6 @@ from memory_store import find_most_similar, load_history, save_record
 
 
 load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    http_client=httpx.Client(proxy="http://127.0.0.1:9567"),
-)
 
 st.title("围棋复盘助手")
 
@@ -112,33 +106,53 @@ def reset_for_new_upload():
 
 
 st.subheader("SGF / KataGo 分析")
-sgf_upload = st.file_uploader("上传 SGF 棋谱", type=["sgf"])
+sgf_upload = st.file_uploader("上传 SGF 棋谱", type=["sgf"], key="sgf_upload")
 if sgf_upload is not None:
     try:
+        sgf_id = hashlib.sha256(sgf_upload.getvalue()).hexdigest()
         game = parse_sgf(sgf_upload.getvalue())
         st.caption("使用主线（第一个变化）；手数 0 为初始局面。胜率与目差均为黑棋视角。")
         move_number = int(st.number_input("分析手数", min_value=0, max_value=len(game.moves),
-                                          value=len(game.moves), key=hashlib.sha256(sgf_upload.getvalue()).hexdigest()))
+                                          value=len(game.moves), key=sgf_id))
         position = game.position(move_number)
+        selection = (sgf_id, move_number)
+        if st.session_state.get("katago_selection") != selection:
+            st.session_state.pop("katago_result", None)
+            st.session_state["katago_selection"] = selection
         st.write(game.metadata)
         st.caption(f"规则：{position.rules}；贴目：{position.komi}；下一手：{position.next_player}")
         fig = draw_board(position.board_data["board_size"], position.board_data["stones"])
         st.pyplot(fig)
         plt.close(fig)
-        if st.button("分析此局面（KataGo）"):
+        if st.button("分析此局面（KataGo）", key="katago_analyze"):
             with st.spinner("KataGo 分析中..."):
-                result = LocalKataGoAdapter.from_env().analyze(position)
+                st.session_state["katago_result"] = LocalKataGoAdapter.from_env().analyze(position)
+        result = st.session_state.get("katago_result")
+        if result is not None:
+            for warning in result.warnings:
+                st.warning(warning)
             if result.status != "ok":
-                st.error(f"{result.status}: {result.error}")
+                message = "KataGo 不可用，请检查引擎、模型和运行库配置。" if result.status == "unavailable" else "KataGo 分析失败，请检查配置或稍后重试。"
+                st.error(f"{message}（{result.status}）")
+                st.caption(result.error)
             else:
                 st.write(f"黑棋胜率：{result.winrate:.1%}；黑棋领先：{result.score_lead:g} 目；最佳着：{result.best_move}")
-                st.dataframe([asdict(candidate) for candidate in result.candidates])
+                st.write(f"当前手番：{'黑棋' if result.current_player == 'black' else '白棋'}；搜索次数（visits）：{result.visits}")
+                st.write("最佳变化（PV）：" + (" → ".join(result.pv) or "无后续变化"))
+                st.caption("候选着使用 GTP 坐标（左下角 A1，跳过 I 列）；probability 为策略先验，不是胜率。")
+                st.dataframe([{**asdict(candidate), "pv": " → ".join(candidate.pv)}
+                              for candidate in result.candidates], hide_index=True)
                 with st.expander("完整分析结果"):
                     st.json(asdict(result))
     except ValueError as error:
+        st.session_state.pop("katago_result", None)
         st.error(f"SGF / 配置错误：{error}")
+else:
+    st.session_state.pop("katago_result", None)
+    st.session_state.pop("katago_selection", None)
 
 
+st.subheader("图片 / GPT 复盘")
 need_review = st.checkbox("识别完成后我要手动核对/修改棋盘", value=True)
 uploader_version = st.session_state.get("uploader_version", 0)
 uploaded_file = st.file_uploader(
@@ -157,7 +171,7 @@ if uploaded_file is not None and "board_data" not in st.session_state:
         prompt_text = """识别围棋截图中的棋盘。判断规格（只能是9、13、19路），从左上到右下逐行核对每个交叉点。
 坐标规则：左上角交叉点为(0,0)，x向右，y向下。只记录真实存在的黑白棋子，不要把星位、数字、阴影、落子编号或装饰识别为棋子。"""
         try:
-            response = client.chat.completions.create(
+            response = get_client().chat.completions.create(
                 model="gpt-5.6",
                 messages=[{
                     "role": "user",

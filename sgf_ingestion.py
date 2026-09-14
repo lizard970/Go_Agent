@@ -1,26 +1,9 @@
 """SGF mainline ingestion. UI coordinates have their origin at top left."""
 from dataclasses import dataclass
 from sgfmill import sgf, boards, sgf_grammar
-from board_state import grid_to_stones
+from board_state import Move, Position, grid_to_stones
 
 COLORS = {'b': 'black', 'w': 'white'}
-
-@dataclass(frozen=True)
-class Move:
-    number: int
-    color: str
-    point: tuple | None  # x, y; None means pass
-
-@dataclass
-class Position:
-    board_data: dict
-    next_player: str
-    move_number: int = 0
-    initial_stones: list | None = None
-    moves: list | None = None
-    initial_player: str = 'black'
-    rules: str = 'japanese'
-    komi: float = 6.5
 
 @dataclass
 class SgfGame:
