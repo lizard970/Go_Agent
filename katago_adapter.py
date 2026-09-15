@@ -1,14 +1,22 @@
-"""One-shot local KataGo analysis protocol; all evaluations use Black's perspective."""
+"""Local KataGo adapters; all evaluations use Black's perspective."""
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 from pathlib import Path
+import itertools
 import json
 import math
 import os
+import queue
 import shutil
 import subprocess
+import threading
+import time
 from dotenv import dotenv_values
 from board_state import Position
+
+
+class KataGoProcessError(RuntimeError):
+    """A persistent KataGo process could not complete the requested query."""
 
 @dataclass(frozen=True)
 class Candidate:
@@ -114,6 +122,27 @@ def build_query(position: Position, *, max_visits: int | None = None):
         query['maxVisits'] = max_visits
     return query
 
+
+def _launch_settings(adapter):
+    executable = shutil.which(adapter.executable) if adapter.executable else None
+    if (not executable or not adapter.config or not adapter.model
+            or not Path(adapter.config).is_file() or not Path(adapter.model).is_file()):
+        return AnalysisResult('unavailable',
+            'Configure valid KATAGO_EXECUTABLE, KATAGO_CONFIG and KATAGO_MODEL paths')
+    executable = str(Path(executable).resolve())
+    timeout = float(adapter.timeout)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('Timeout must be positive and finite')
+    environment = os.environ.copy()
+    if adapter.dll_directory:
+        if not Path(adapter.dll_directory).is_dir():
+            return AnalysisResult('unavailable', 'KATAGO_DLL_DIRECTORY is not a valid runtime directory')
+        environment['PATH'] = adapter.dll_directory + os.pathsep + environment.get('PATH', '')
+    command = [executable, 'analysis', '-config', str(Path(adapter.config).resolve()),
+        '-model', str(Path(adapter.model).resolve()),
+        '-override-config', 'reportAnalysisWinratesAs=BLACK']
+    return command, timeout, environment, str(Path(executable).parent)
+
 @dataclass
 class LocalKataGoAdapter:
     executable: str = ''
@@ -138,25 +167,15 @@ class LocalKataGoAdapter:
 
     def analyze(self, position: Position, *, max_visits: int | None = None) -> AnalysisResult:
         try:
-            executable = shutil.which(self.executable) if self.executable else None
-            if not executable or not self.config or not self.model or not Path(self.config).is_file() or not Path(self.model).is_file():
-                return AnalysisResult('unavailable', 'Configure valid KATAGO_EXECUTABLE, KATAGO_CONFIG and KATAGO_MODEL paths')
-            executable = str(Path(executable).resolve())
-            timeout = float(self.timeout)
-            if not math.isfinite(timeout) or timeout <= 0:
-                raise ValueError('Timeout must be positive and finite')
-            environment = os.environ.copy()
-            if self.dll_directory:
-                if not Path(self.dll_directory).is_dir():
-                    return AnalysisResult('unavailable', 'KATAGO_DLL_DIRECTORY is not a valid runtime directory')
-                environment['PATH'] = self.dll_directory + os.pathsep + environment.get('PATH', '')
+            settings = _launch_settings(self)
+            if isinstance(settings, AnalysisResult):
+                return settings
+            command, timeout, environment, cwd = settings
             query = build_query(position, max_visits=max_visits)
-            completed = subprocess.run([executable, 'analysis', '-config', str(Path(self.config).resolve()),
-                '-model', str(Path(self.model).resolve()),
-                '-override-config', 'reportAnalysisWinratesAs=BLACK'],
+            completed = subprocess.run(command,
                 input=json.dumps(query)+'\n', capture_output=True, text=True, encoding='utf-8',
                 errors='replace', timeout=timeout, env=environment,
-                cwd=str(Path(executable).resolve().parent),
+                cwd=cwd,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             if completed.returncode:
                 return AnalysisResult('error', f'KataGo exited {completed.returncode}: {completed.stderr[-2000:]}')
@@ -182,3 +201,163 @@ class LocalKataGoAdapter:
             return AnalysisResult('error', 'KataGo analysis timed out')
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             return AnalysisResult('error', str(exc))
+
+
+_EOF = object()
+
+
+@dataclass
+class PersistentKataGoAdapter(LocalKataGoAdapter):
+    """One long-lived Analysis Engine process with serialized request handling."""
+
+    _process: subprocess.Popen | None = field(default=None, init=False, repr=False)
+    _stdout_queue: queue.Queue | None = field(default=None, init=False, repr=False)
+    _reader_thread: threading.Thread | None = field(default=None, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _query_ids: itertools.count = field(default_factory=lambda: itertools.count(1), init=False, repr=False)
+
+    @property
+    def pid(self) -> int | None:
+        process = self._process
+        return process.pid if process is not None and process.poll() is None else None
+
+    @staticmethod
+    def _read_stdout(stream, output_queue):
+        try:
+            for line in stream:
+                output_queue.put(line)
+        finally:
+            output_queue.put(_EOF)
+
+    def _start_locked(self, command, environment, cwd):
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, encoding='utf-8', errors='replace',
+                bufsize=1, env=environment, cwd=cwd,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        except OSError as exc:
+            raise KataGoProcessError(f'Unable to start KataGo: {exc}') from exc
+        if process.stdin is None or process.stdout is None:
+            process.kill()
+            raise KataGoProcessError('KataGo process did not expose stdin/stdout')
+        output_queue = queue.Queue()
+        reader = threading.Thread(target=self._read_stdout,
+            args=(process.stdout, output_queue), name='katago-stdout', daemon=True)
+        self._process = process
+        self._stdout_queue = output_queue
+        self._reader_thread = reader
+        try:
+            reader.start()
+        except RuntimeError as exc:
+            self._stop_locked()
+            raise KataGoProcessError(f'Unable to start KataGo stdout reader: {exc}') from exc
+
+    def _stop_locked(self):
+        process = self._process
+        reader = self._reader_thread
+        self._process = None
+        self._stdout_queue = None
+        self._reader_thread = None
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except OSError:
+            pass
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            except OSError:
+                pass
+        try:
+            if process.stdout is not None:
+                process.stdout.close()
+        except OSError:
+            pass
+        if reader is not None and reader.ident is not None and reader is not threading.current_thread():
+            reader.join(timeout=1)
+
+    def close(self):
+        with self._lock:
+            self._stop_locked()
+
+    shutdown = close
+
+    def analyze(self, position: Position, *, max_visits: int | None = None) -> AnalysisResult:
+        with self._lock:
+            try:
+                settings = _launch_settings(self)
+                if isinstance(settings, AnalysisResult):
+                    return settings
+                command, timeout, environment, cwd = settings
+                query = build_query(position, max_visits=max_visits)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                return AnalysisResult('error', str(exc))
+
+            process = self._process
+            if process is not None and process.poll() is not None:
+                return_code = process.returncode
+                self._stop_locked()
+                raise KataGoProcessError(f'KataGo process exited before query (code {return_code})')
+            if process is None:
+                self._start_locked(command, environment, cwd)
+                process = self._process
+
+            query['id'] = f'position-{next(self._query_ids)}'
+            try:
+                process.stdin.write(json.dumps(query) + '\n')
+                process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                self._stop_locked()
+                raise KataGoProcessError(f'Unable to send KataGo query: {exc}') from exc
+
+            warnings = []
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._stop_locked()
+                    raise KataGoProcessError(f'KataGo query {query["id"]} timed out')
+                try:
+                    line = self._stdout_queue.get(timeout=remaining)
+                except queue.Empty as exc:
+                    self._stop_locked()
+                    raise KataGoProcessError(f'KataGo query {query["id"]} timed out') from exc
+                if line is _EOF:
+                    return_code = process.poll()
+                    self._stop_locked()
+                    raise KataGoProcessError(f'KataGo process closed stdout (code {return_code})')
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, TypeError) as exc:
+                    self._stop_locked()
+                    raise KataGoProcessError(f'Malformed KataGo response: {exc}') from exc
+                if data.get('id') != query['id']:
+                    continue
+                if 'error' in data:
+                    result = normalize_output(data)
+                    result.warnings = warnings
+                    return result
+                if 'warning' in data:
+                    warnings.append(str(data['warning']))
+                    continue
+                if (data.get('turnNumber') != len(query['moves'])
+                        or data.get('isDuringSearch', False)):
+                    continue
+                result = normalize_output(data)
+                result.warnings = warnings
+                if result.status == 'ok' and result.current_player != position.next_player:
+                    return AnalysisResult('error',
+                        'KataGo current player does not match requested position', warnings=warnings)
+                return result

@@ -1,3 +1,42 @@
+# PersistentKataGoAdapter（2026-09-15，已完成）
+
+## 实现
+
+`PersistentKataGoAdapter` 实现现有 `KataGoAdapter.analyze(position, max_visits=...)`
+协议并复用 `build_query()` / `normalize_output()`。它只负责持久 Analysis Engine 进程：
+
+- 第一次查询启动一次 `katago.exe analysis`，保持 stdin/stdout；后续串行查询复用进程。
+- `threading.Lock` 覆盖整次 analyze，单调递增的 `position-N` 为每次查询提供唯一 id。
+- 后台 reader 只把 stdout 行送入队列；调用线程按每次查询自己的 deadline 等待匹配 id，
+  忽略其他 id 和搜索中间结果，保留匹配查询的 warning。
+- timeout、断管、stdout 提前关闭、非 JSON 输出或已死亡进程抛出 `KataGoProcessError`，
+  同时清空并终止当前进程；下一次 analyze 可以重新启动。
+- 引擎正常返回的规则/请求错误仍转换为 `AnalysisResult(status='error')`；配置缺失仍返回
+  `unavailable`。结果结构和黑棋视角语义没有改变。
+- `close()` / `shutdown()` 幂等地关闭 stdin 并终止进程。`pid` 属性用于生命周期验证。
+- `LocalKataGoAdapter` 行为不变，只与 persistent 实现共享启动路径、超时、运行库校验。
+
+没有修改 UI、数据库 schema、全盘分析或 adapter 选择策略；Streamlit 仍明确使用现有
+`LocalKataGoAdapter`。
+
+## 验证
+
+- 普通 `pytest -q`: **60 passed, 4 skipped**。
+- persistent 单元测试覆盖：两次查询只启动一个进程、唯一/匹配 response id、忽略其他 id、
+  最佳候选空 PV、每查询 timeout 清理、shutdown 终止、死亡进程本次报错后下次重启。
+- 真机 integration: **3 passed**。最终代码另行复跑持久测试 **1 passed**；连续查询
+  move 2 / move 4 的 PID 均为 **8656**：
+  - move 2: winrate 0.977725504，score lead +3.36832486，best F5，visits 154。
+  - move 4: winrate 0.998111659，score lead +9.28294545，best F4，visits 154。
+- `compileall`、`git diff --check` 通过。
+
+## 下一步
+
+在独立 service/lifecycle 层决定 persistent adapter 的应用级所有权和关闭时机，再接入 UI；
+不要在 Streamlit rerun 中无缓存地创建持久 adapter，也不要同时实现全盘扫描。
+
+---
+
 # Streamlit 原型迁移（2026-09-15，已完成）
 
 ## 实现状态

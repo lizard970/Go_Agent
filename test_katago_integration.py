@@ -4,7 +4,7 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 import pytest
-from katago_adapter import LocalKataGoAdapter
+from katago_adapter import LocalKataGoAdapter, PersistentKataGoAdapter
 from sgf_ingestion import parse_sgf
 
 SGF = b'(;SZ[9]KM[6.5];B[ba];W[aa];B[ab];W[])'
@@ -27,3 +27,23 @@ def test_real_engine(move_number, tmp_path):
     (artifact_dir/f'move-{move_number}.json').write_text(json.dumps(asdict(result),indent=2),encoding='utf-8')
     print(json.dumps({'move':move_number,'winrate':result.winrate,'score_lead':result.score_lead,
                       'best_move':result.best_move,'visits':result.visits,'pv':result.pv}))
+
+
+def test_real_persistent_engine_reuses_pid():
+    game = parse_sgf(SGF)
+    adapter = PersistentKataGoAdapter.from_env()
+    try:
+        first = adapter.analyze(game.position(2), max_visits=150)
+        first_pid = adapter.pid
+        second = adapter.analyze(game.position(4), max_visits=150)
+        second_pid = adapter.pid
+    finally:
+        adapter.close()
+    assert first.status == second.status == 'ok', (first.error, second.error)
+    assert first.move_number == 2 and second.move_number == 4
+    assert first_pid is not None and first_pid == second_pid
+    print(json.dumps({'persistent_pid': first_pid,
+        'move_2': {'winrate': first.winrate, 'score_lead': first.score_lead,
+                   'best_move': first.best_move, 'visits': first.visits, 'pv': first.pv},
+        'move_4': {'winrate': second.winrate, 'score_lead': second.score_lead,
+                   'best_move': second.best_move, 'visits': second.visits, 'pv': second.pv}}))

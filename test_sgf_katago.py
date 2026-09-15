@@ -1,9 +1,11 @@
 import json
+import queue
 import subprocess
 from unittest.mock import patch
 import pytest
 from sgf_ingestion import parse_sgf, Position
-from katago_adapter import LocalKataGoAdapter, normalize_output, build_query
+from katago_adapter import (KataGoProcessError, LocalKataGoAdapter,
+                            PersistentKataGoAdapter, normalize_output, build_query)
 from board_state import stones_to_grid, grid_to_stones
 
 
@@ -197,3 +199,148 @@ def test_mismatched_player(configured):
     with patch('katago_adapter.shutil.which',return_value='katago'), patch('katago_adapter.subprocess.run') as run:
         run.return_value = subprocess.CompletedProcess([],0,json.dumps(raw),'')
         assert adapter.analyze(position).status == 'error'
+
+
+class FakeStdout:
+    def __init__(self):
+        self.lines = queue.Queue()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.lines.get()
+        if line is None:
+            raise StopIteration
+        return line
+
+    def close(self):
+        self.lines.put(None)
+
+
+class FakeStdin:
+    def __init__(self, process, respond=True, empty_pv=False):
+        self.process = process
+        self.respond = respond
+        self.empty_pv = empty_pv
+        self.closed = False
+
+    def write(self, line):
+        query_data = json.loads(line)
+        self.process.queries.append(query_data)
+        if self.respond:
+            raw = output()
+            raw['id'] = query_data['id']
+            raw['turnNumber'] = len(query_data['moves'])
+            raw['rootInfo']['currentPlayer'] = query_data['initialPlayer']
+            if self.empty_pv:
+                raw['moveInfos'][1]['pv'] = []
+            self.process.response_ids.append(raw['id'])
+            self.process.stdout.lines.put(json.dumps({**raw, 'id': 'another-query'}) + '\n')
+            self.process.stdout.lines.put(json.dumps(raw) + '\n')
+        return len(line)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class FakeProcess:
+    def __init__(self, pid, respond=True, empty_pv=False):
+        self.pid = pid
+        self.returncode = None
+        self.queries = []
+        self.response_ids = []
+        self.stdout = FakeStdout()
+        self.stdin = FakeStdin(self, respond, empty_pv)
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+        self.stdout.lines.put(None)
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+        self.stdout.lines.put(None)
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+class FakePopen:
+    def __init__(self, *, respond=True, empty_pv=False):
+        self.respond = respond
+        self.empty_pv = empty_pv
+        self.processes = []
+
+    def __call__(self, *args, **kwargs):
+        process = FakeProcess(4100 + len(self.processes), self.respond, self.empty_pv)
+        self.processes.append(process)
+        return process
+
+
+@pytest.fixture
+def persistent(configured):
+    adapter, position = configured
+    return PersistentKataGoAdapter(adapter.executable, adapter.config, adapter.model), position
+
+
+def test_persistent_reuses_process_and_matches_unique_response_ids(persistent):
+    adapter, position = persistent
+    popen = FakePopen()
+    with patch('katago_adapter.shutil.which', return_value='katago'), \
+            patch('katago_adapter.subprocess.Popen', side_effect=popen):
+        first = adapter.analyze(position)
+        pid = adapter.pid
+        second = adapter.analyze(position)
+        adapter.close()
+    assert first.status == second.status == 'ok'
+    assert len(popen.processes) == 1 and pid == 4100
+    process = popen.processes[0]
+    query_ids = [item['id'] for item in process.queries]
+    assert query_ids == process.response_ids
+    assert len(set(query_ids)) == 2
+
+
+def test_persistent_accepts_empty_best_pv_and_shutdown_stops_process(persistent):
+    adapter, position = persistent
+    popen = FakePopen(empty_pv=True)
+    with patch('katago_adapter.shutil.which', return_value='katago'), \
+            patch('katago_adapter.subprocess.Popen', side_effect=popen):
+        result = adapter.analyze(position)
+        adapter.shutdown()
+    assert result.status == 'ok' and result.pv == []
+    assert popen.processes[0].terminated and adapter.pid is None
+
+
+def test_persistent_timeout_cleans_process(persistent):
+    adapter, position = persistent
+    adapter.timeout = .01
+    popen = FakePopen(respond=False)
+    with patch('katago_adapter.shutil.which', return_value='katago'), \
+            patch('katago_adapter.subprocess.Popen', side_effect=popen), \
+            pytest.raises(KataGoProcessError, match='timed out'):
+        adapter.analyze(position)
+    assert popen.processes[0].terminated and adapter.pid is None
+
+
+def test_persistent_dead_process_errors_then_restarts(persistent):
+    adapter, position = persistent
+    popen = FakePopen()
+    with patch('katago_adapter.shutil.which', return_value='katago'), \
+            patch('katago_adapter.subprocess.Popen', side_effect=popen):
+        assert adapter.analyze(position).status == 'ok'
+        popen.processes[0].terminate()
+        with pytest.raises(KataGoProcessError, match='exited before query'):
+            adapter.analyze(position)
+        assert adapter.analyze(position).status == 'ok'
+        adapter.close()
+    assert len(popen.processes) == 2
