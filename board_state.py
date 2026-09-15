@@ -19,6 +19,16 @@ class Position:
     rules: str = 'japanese'
     komi: float = 6.5
 
+
+def point_to_gtp(point, board_size):
+    if point is None:
+        return 'pass'
+    x, y = point
+    if (type(x) is not int or type(y) is not int
+            or not 2 <= board_size <= 19 or not (0 <= x < board_size and 0 <= y < board_size)):
+        raise ValueError('Stone coordinate outside board')
+    return 'ABCDEFGHJKLMNOPQRST'[x] + str(board_size - y)
+
 def stones_to_grid(board_size, stones):
     grid = [["empty" for _ in range(board_size)] for _ in range(board_size)]
     for stone in stones:

@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from dotenv import dotenv_values
-from board_state import Position
+from board_state import Position, point_to_gtp
 
 
 class KataGoProcessError(RuntimeError):
@@ -97,14 +97,6 @@ def normalize_output(data: dict) -> AnalysisResult:
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         return AnalysisResult('error', f'Malformed KataGo output: {exc}')
 
-def _vertex(point, size):
-    if point is None:
-        return 'pass'
-    x, y = point
-    if type(x) is not int or type(y) is not int or not (0 <= x < size and 0 <= y < size):
-        raise ValueError('Stone coordinate outside board')
-    return 'ABCDEFGHJKLMNOPQRST'[x] + str(size-y)
-
 def build_query(position: Position, *, max_visits: int | None = None):
     size = position.board_data['board_size']
     if type(size) is not int or not 2 <= size <= 19:
@@ -112,8 +104,8 @@ def build_query(position: Position, *, max_visits: int | None = None):
     colors = {'black':'B', 'white':'W'}
     stones = position.board_data['stones'] if position.moves is None else position.initial_stones
     query = {'id':'position', 'boardXSize':size, 'boardYSize':size,
-        'initialStones':[[colors[s['color']], _vertex((s['x'],s['y']),size)] for s in stones],
-        'moves':[[colors[m.color], _vertex(m.point,size)] for m in (position.moves or [])],
+        'initialStones':[[colors[s['color']], point_to_gtp((s['x'],s['y']),size)] for s in stones],
+        'moves':[[colors[m.color], point_to_gtp(m.point,size)] for m in (position.moves or [])],
         'initialPlayer':colors[position.next_player if position.moves is None else position.initial_player],
         'rules':position.rules, 'komi':_number(position.komi), 'includePolicy':True}
     if max_visits is not None:

@@ -4,10 +4,13 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 import pytest
+from game_scan import scan_game
 from katago_adapter import LocalKataGoAdapter, PersistentKataGoAdapter
 from sgf_ingestion import parse_sgf
 
 SGF = b'(;SZ[9]KM[6.5];B[ba];W[aa];B[ab];W[])'
+SHORT_SCAN_SGF = b"""(;SZ[9]KM[6.5]
+;B[aa];W[cc];B[ee];W[gg];B[ii];W[ac];B[ce];W[eg];B[gi];W[])"""
 pytestmark = [pytest.mark.integration, pytest.mark.skipif(
     os.getenv('RUN_KATAGO_INTEGRATION') != '1', reason='Set RUN_KATAGO_INTEGRATION=1 for real KataGo')]
 
@@ -47,3 +50,30 @@ def test_real_persistent_engine_reuses_pid():
                    'best_move': first.best_move, 'visits': first.visits, 'pv': first.pv},
         'move_4': {'winrate': second.winrate, 'score_lead': second.score_lead,
                    'best_move': second.best_move, 'visits': second.visits, 'pv': second.pv}}))
+
+
+def test_real_short_full_game_scan_reuses_pid_and_closes_process():
+    adapter = PersistentKataGoAdapter.from_env()
+    pids = []
+
+    class RecordingAdapter:
+        def analyze(self, position, *, max_visits=None):
+            result = adapter.analyze(position, max_visits=max_visits)
+            pids.append(adapter.pid)
+            return result
+
+    process = None
+    try:
+        result = scan_game(parse_sgf(SHORT_SCAN_SGF), RecordingAdapter(), max_visits=10)
+        process = adapter._process
+    finally:
+        adapter.close()
+    assert len(result.position_analyses) == 11 and len(result.moves) == 10
+    assert [analysis.move_number for analysis in result.position_analyses] == list(range(11))
+    assert len(pids) == 11 and pids[0] is not None and len(set(pids)) == 1
+    assert all(analysis.status == 'ok' for analysis in result.position_analyses)
+    assert adapter.pid is None and process is not None and process.poll() is not None
+    print(json.dumps({'scan_positions': len(result.position_analyses),
+                      'move_records': len(result.moves), 'queries': len(pids),
+                      'persistent_pid': pids[0], 'process_returncode': process.returncode,
+                      'visits': [analysis.visits for analysis in result.position_analyses]}))

@@ -8,7 +8,8 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 import analyzer
-from katago_adapter import AnalysisResult, LocalKataGoAdapter, normalize_output
+from katago_adapter import (AnalysisResult, LocalKataGoAdapter,
+                            PersistentKataGoAdapter, normalize_output)
 import memory_store
 from test_sgf_katago import output
 
@@ -66,12 +67,32 @@ def test_sgf_result_persists_invalidates_and_uses_modes(uploads, monkeypatch):
     raw["turnNumber"] = 4
     analyze = Mock(return_value=normalize_output(raw))
     monkeypatch.setattr(LocalKataGoAdapter, "analyze", analyze)
+    def scan_response(position, *, max_visits=None):
+        scan_raw = output()
+        scan_raw["turnNumber"] = position.move_number
+        scan_raw["rootInfo"]["currentPlayer"] = "B" if position.next_player == "black" else "W"
+        return normalize_output(scan_raw)
+    scan_analyze = Mock(side_effect=scan_response)
+    close = Mock()
+    monkeypatch.setattr(PersistentKataGoAdapter, "analyze", scan_analyze)
+    monkeypatch.setattr(PersistentKataGoAdapter, "close", close)
     at = review_app()
     at.button(key="katago_analyze").click().run()
     assert not at.exception and not at.error
     assert analyze.call_args.kwargs["max_visits"] == 150
     assert any("visits：500" in item.value for item in at.caption)
     assert any("D4 → E5" in item.value for item in at.markdown)
+    assert at.metric[0].value == "60.0%" and at.metric[1].value == "+2.3"
+    at.segmented_control(key="sgf_user_color").set_value("W").run()
+    assert analyze.call_count == 1
+    assert at.metric[0].value == "40.0%" and at.metric[1].value == "-2.3"
+    at.button(key="scan_game").click().run()
+    assert scan_analyze.call_count == 5
+    assert {call.kwargs["max_visits"] for call in scan_analyze.call_args_list} == {100}
+    assert close.call_count == 1
+    assert any("已完成 5 个局面、4 手" in item.value for item in at.success)
+    at.segmented_control(key="sgf_user_color").set_value("B").run()
+    assert scan_analyze.call_count == 5
     at.segmented_control(key="review_depth").set_value("深度").run()
     assert not any("visits：500" in item.value for item in at.caption)
     at.button(key="katago_analyze").click().run()

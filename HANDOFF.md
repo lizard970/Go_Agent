@@ -1,3 +1,62 @@
+# SGF 全盘快扫 v1（2026-09-15，已完成）
+
+## 实现
+
+新增 UI 无关的 `game_scan.py`。`scan_game(game, adapter, max_visits=100)` 对 N 手主线严格
+调用 N+1 次现有 adapter：初始局面一次，再依次分析第 1 至 N 手后的局面。返回：
+
+- `GameScanResult.position_analyses`: N+1 个原始标准化 `AnalysisResult`，仍全部为黑棋视角。
+- `GameScanResult.moves`: N 个 `MoveAnalysis`，第 n 条固定使用 analyses[n-1] 作为 before、
+  analyses[n] 作为 after。
+- `MoveAnalysis`: `move_number`、`player`（B/W）、`actual_move`（GTP/pass）、
+  `best_move_before`、before/after 黑棋胜率与目差、实际行棋方胜率损失与目差损失、
+  `visits`（before 分析）、合并去重 warnings。
+
+黑棋行棋损失直接使用黑棋 before-after；白棋先转换为 `1 - black_winrate` 与
+`-black_score_lead` 再计算 before-after，因此负损失代表该手让行棋方变好。坐标格式化抽到
+共享 `board_state.point_to_gtp()`，adapter 和扫描层共同使用。
+
+SGF UI 的 `sgf_user_color` 值为 `B` 或 `W`，仅影响“你的胜率/目差”、扫描表格的用户视角列
+和本人标记。改变用户颜色不会清除或重新调用单局面/全盘引擎结果。引擎标准结果继续保持
+黑棋视角。全盘按钮在一次点击内创建 `PersistentKataGoAdapter`，顺序扫描后在 `finally`
+关闭，不把进程跨 Streamlit rerun 缓存。
+
+`KATAGO_SCAN_VISITS` 可通过进程环境或项目 `.env` 配置，缺省和预期生产快扫值均为 **100**；
+`.env.example` 已记录。真机自动测试特意使用 10 visits，没有运行长棋谱 benchmark。
+
+## 验证
+
+- 普通 `pytest -q`: **64 passed, 5 skipped**。
+- 20 手 mock SGF：严格 **21** 次调用，位置序号 0–20，产生 21 个 position results / 20 个
+  MoveAnalysis；before/after、手数、实战着、黑白损失、pass 和默认 100 visits 均通过。
+- AppTest：白棋展示将黑棋 60% / +2.3 转为用户 40% / -2.3；切换用户颜色不增加调用；
+  4 手 UI 扫描严格调用 5 次并关闭 adapter。
+- 真机 integration: **4 passed**。短扫描棋谱 10 手、11 个局面，使用 10 visits；11 次查询
+  PID 均为 **22860**，返回 11 个有效标准结果和 10 条 MoveAnalysis；shutdown 后
+  `process.poll()` 非空，无遗留进程。
+- Edge / Streamlit / 真实 KataGo E2E: **1 passed**；单局面流程适配用户视角标签。
+- `compileall` 与 Git whitespace check 通过。
+
+## 100 手手工验证
+
+在 PowerShell 进入项目后执行：
+
+```powershell
+$env:KATAGO_SCAN_VISITS='100'
+.\start.bat --server.port=8501 --server.address=127.0.0.1
+```
+
+浏览器中进入“新建复盘 / SGF复盘” → 上传 100 手 SGF → 选择黑棋或白棋 → 点击
+“扫描全局 · 100 visits”。完成提示必须为“已完成 101 个局面、100 手”，表格必须为 100 行。
+关闭启动窗口后可执行 `Remove-Item Env:KATAGO_SCAN_VISITS` 清除当前 PowerShell 的覆盖值。
+
+## 下一步
+
+先记录上述 100 手人工测试的总耗时和失败位置；通过后再单独设计关键错误排序与 Top-K，
+本阶段没有预埋排名或深挖逻辑。
+
+---
+
 # PersistentKataGoAdapter（2026-09-15，已完成）
 
 ## 实现

@@ -56,7 +56,7 @@ def test_navigation_and_real_sgf_flow(tmp_path):
                 pv = page.locator('[data-testid="stMarkdownContainer"]').filter(has_text="最佳变化").inner_text()
                 visits = visits_panel.inner_text()
                 assert re.search(r"visits：[1-9]\d*", visits)
-                assert "黑棋胜率" in summary and "推荐着" in summary and "→" in pv
+                assert "你的胜率" in summary and "推荐着" in summary and "→" in pv
                 expect(page.get_by_role("heading", name="LLM 解释")).to_be_visible()
                 report.append({"move": move, "summary": summary, "visits": visits, "pv": pv})
                 page.screenshot(path=str(artifact_dir / f"prototype-ui-move-{move}.png"), full_page=True)

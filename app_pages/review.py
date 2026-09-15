@@ -11,7 +11,10 @@ from PIL import Image
 
 import analyzer
 from board_state import grid_to_stones, stones_to_grid
-from katago_adapter import LocalKataGoAdapter
+from game_scan import (GameScanError, metrics_for_color, scan_game,
+                       scan_visits_from_env)
+from katago_adapter import (KataGoProcessError, LocalKataGoAdapter,
+                            PersistentKataGoAdapter)
 from memory_store import find_most_similar, load_history, save_record
 from sgf_ingestion import parse_sgf
 from ui import STATE_CYCLE, STATE_LABEL, draw_board
@@ -47,18 +50,21 @@ def reset_image_review():
     st.session_state["uploader_version"] = st.session_state.get("uploader_version", 0) + 1
 
 
-def render_katago_result(result):
+def render_katago_result(result, user_color):
     for warning in result.warnings:
         st.warning(warning)
     if result.status != "ok":
         st.error("KataGo 不可用" if result.status == "unavailable" else "KataGo 分析失败")
         st.caption(result.error)
         return
+    user_winrate, user_score_lead = metrics_for_color(result.winrate, result.score_lead, user_color)
+    color_label = "黑棋" if user_color == "B" else "白棋"
     one, two, three = st.columns(3)
-    one.metric("黑棋胜率", f"{result.winrate:.1%}", border=True)
-    two.metric("黑棋目差", f"{result.score_lead:+.1f}", border=True)
+    one.metric("你的胜率", f"{user_winrate:.1%}", border=True)
+    two.metric("你的目差", f"{user_score_lead:+.1f}", border=True)
     three.metric("推荐着", result.best_move, border=True)
-    st.caption(f"当前手番：{'黑棋' if result.current_player == 'black' else '白棋'} · visits：{result.visits} · 黑棋视角")
+    st.caption(f"你执：{color_label} · 当前手番：{'黑棋' if result.current_player == 'black' else '白棋'} "
+               f"· visits：{result.visits} · 原始证据为黑棋视角")
     st.markdown("**最佳变化**　" + (" → ".join(result.pv) or "无后续变化"))
     with st.expander("候选着与完整证据"):
         st.dataframe([{**asdict(candidate), "pv": " → ".join(candidate.pv)}
@@ -67,12 +73,18 @@ def render_katago_result(result):
 
 
 def render_sgf():
-    upload_col, move_col = st.columns([1.15, 1], gap="medium", vertical_alignment="bottom")
+    upload_col, move_col, color_col = st.columns([1.15, .75, .55], gap="medium", vertical_alignment="bottom")
     with upload_col:
         uploaded = st.file_uploader("上传 SGF 棋谱", type=["sgf"], key="sgf_upload")
+    with color_col:
+        user_color = st.segmented_control("你执", ["B", "W"], default="B", required=True,
+                                          format_func=lambda color: "黑棋" if color == "B" else "白棋",
+                                          key="sgf_user_color", persist_state="session")
     if uploaded is None:
         st.session_state.pop("katago_result", None)
         st.session_state.pop("katago_selection", None)
+        st.session_state.pop("game_scan_result", None)
+        st.session_state.pop("game_scan_selection", None)
         st.info("上传 SGF 后可选择任意局面。KataGo 只在点击分析时运行。")
         return
     try:
@@ -114,11 +126,49 @@ def render_sgf():
             if result is None:
                 st.caption("尚未分析。")
             else:
-                render_katago_result(result)
+                render_katago_result(result, user_color)
         with st.container(border=True, key="explanation_panel"):
             st.subheader("LLM 解释")
             st.caption("当前阶段尚未接入 KataGo Evidence → LLM；这里不会展示原型中的虚构解释。")
             st.button("加入错题本", disabled=True, help="需先完成后续 Evidence → LLM 与事件级存储。")
+
+    try:
+        scan_visits = scan_visits_from_env()
+    except ValueError as error:
+        st.error(str(error))
+        scan_visits = None
+    scan_selection = sgf_id, scan_visits
+    if st.session_state.get("game_scan_selection") != scan_selection:
+        st.session_state.pop("game_scan_result", None)
+        st.session_state["game_scan_selection"] = scan_selection
+    st.subheader("全盘扫描")
+    st.caption(f"固定分析初始局面及每手后的局面，共 {len(game.moves) + 1} 次；不执行关键手排序。")
+    scan_label = f"扫描全局 · {scan_visits} visits" if scan_visits is not None else "扫描全局 · 配置错误"
+    if st.button(scan_label, key="scan_game", disabled=scan_visits is None):
+        st.session_state.pop("game_scan_result", None)
+        adapter = PersistentKataGoAdapter.from_env()
+        try:
+            with st.spinner(f"正在顺序分析 {len(game.moves) + 1} 个局面…"):
+                st.session_state["game_scan_result"] = scan_game(game, adapter, max_visits=scan_visits)
+        except (GameScanError, KataGoProcessError, ValueError) as error:
+            st.error(f"全盘扫描失败：{error}")
+        finally:
+            adapter.close()
+    scan_result = st.session_state.get("game_scan_result")
+    if scan_result is not None:
+        st.success(f"已完成 {len(scan_result.position_analyses)} 个局面、{len(scan_result.moves)} 手。")
+        rows = []
+        for move in scan_result.moves:
+            user_before = metrics_for_color(move.black_winrate_before, move.black_score_lead_before, user_color)
+            user_after = metrics_for_color(move.black_winrate_after, move.black_score_lead_after, user_color)
+            rows.append({"手数": move.move_number, "行棋方": "黑" if move.player == "B" else "白",
+                         "本人": move.player == user_color, "实战": move.actual_move,
+                         "推荐": move.best_move_before, "你的胜率·前": user_before[0],
+                         "你的胜率·后": user_after[0], "你的目差·前": user_before[1],
+                         "你的目差·后": user_after[1], "行棋方胜率损失": move.player_winrate_loss,
+                         "行棋方目差损失": move.player_score_loss, "visits": move.visits,
+                         "warnings": " · ".join(move.warnings)})
+        st.dataframe(rows, hide_index=True, width="stretch")
 
 
 def recognize_image(uploaded):
