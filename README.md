@@ -1,5 +1,5 @@
 [README_GoReview_Agent.md](https://github.com/user-attachments/files/32335074/README_GoReview_Agent.md)
-# GoReview Agent
+# Go Agent
 
 > 面向业余围棋学习者的 **AI Agent 复盘与错题记忆系统**  
 > 通过 LLM Planner 理解复盘目标，调用本地 KataGo 完成确定性棋力分析，再结合结构化 Evidence、批量点评与长期错误记忆，帮助用户把“一盘棋的数据”转化为“下一盘真正能改掉的问题”。
