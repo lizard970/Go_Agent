@@ -1,46 +1,51 @@
-from collections import Counter
 from datetime import datetime, timedelta
 
 import streamlit as st
 
-from memory_store import load_mistake_records
+from memory_store import load_dashboard_summary
 from ui import page_banner
 
 
-page_banner("成长看板", "所有指标来自当前 SQLite 错题本；数据不足时不生成演示趋势。")
-records = load_mistake_records()
-now = datetime.now()
-recent = [r for r in records if datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S") >= now - timedelta(days=30)]
-counts = Counter(issue["issue_type"] for r in records for issue in r["issues"])
-top_issue = counts.most_common(1)[0][0] if counts else "暂无"
-repeated = sum(count > 1 for count in counts.values())
-recurrence = repeated / len(counts) if counts else 0
+def local_created_at(value):
+    parsed = datetime.fromisoformat(value)
+    return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
 
-cols = st.columns(4)
-cols[0].metric("总复盘数", len(records), border=True)
-cols[1].metric("近 30 天复盘", len(recent), border=True)
-cols[2].metric("高频错误类型", top_issue, border=True)
-cols[3].metric("重复错误类型占比", f"{recurrence:.0%}", border=True,
-               help="出现超过一次的错误类型占全部错误类型的比例。")
+
+page_banner("成长看板", "按已分析棋局和结构化错题分别统计，不使用自然语言标题充当错误类型。")
+summary = load_dashboard_summary()
+now = datetime.now()
+recent_count = sum(
+    local_created_at(value) >= now - timedelta(days=30)
+    for value in summary["game_dates"]
+)
+
+cols = st.columns(3)
+cols[0].metric("总复盘数", summary["total_reviews"], border=True)
+cols[1].metric("近 30 天复盘", recent_count, border=True)
+cols[2].metric("累计错题数", summary["mistake_count"], border=True)
 
 left, right = st.columns([1.6, 1], gap="medium")
 with left.container(border=True):
     st.subheader("复盘趋势")
-    if records:
-        by_day = Counter(r["created_at"][:10] for r in records)
-        st.line_chart({"复盘数": dict(sorted(by_day.items()))}, x_label="日期", y_label="记录数")
+    if summary["games_by_date"]:
+        st.line_chart(
+            {"完成棋局数": summary["games_by_date"]},
+            x_label="日期", y_label="棋局数",
+        )
     else:
-        st.info("保存复盘后才会形成趋势。")
+        st.info("完成棋局分析后才会形成趋势。")
 with right.container(border=True):
-    st.subheader("错误类型分布")
-    if counts:
-        st.bar_chart(dict(counts.most_common()), horizontal=True, x_label="次数", y_label="错误类型")
+    st.subheader("错题阶段分布")
+    if summary["phase_counts"]:
+        labels = {"opening": "布局", "middlegame": "中盘", "endgame": "官子"}
+        values = {
+            labels.get(phase, phase): count
+            for phase, count in summary["phase_counts"].items()
+        }
+        st.bar_chart(values, horizontal=True, x_label="错题数", y_label="阶段")
     else:
-        st.info("当前没有结构化错误标签。")
+        st.info("当前没有结构化 ErrorEvent。")
 
-st.subheader("最近记录")
-if records:
-    st.dataframe([{"时间": r["created_at"], "棋盘": f"{r['board_size']} 路",
-                   "错误数": len(r["issues"]), "摘要": r["position_summary"]} for r in records[:8]], hide_index=True)
-else:
-    st.caption("暂无真实记录。")
+st.caption(
+    "总复盘数和趋势按不同棋局去重；累计错题数与阶段分布按已保存 ErrorEvent 统计。"
+)

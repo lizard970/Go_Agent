@@ -1,5 +1,12 @@
 .env
 venv/
+review_history.db
+analyzer.py
+deep_analysis.py
+memory_store.py
+review_history.db
+review_agent.py
+HANDOFF.md
 __pycache__/
 .pytest_cache/
 temp/
@@ -7,6 +14,9 @@ temp/
 *.db-*
 *.png
 streamlit
+
+# 测试案例
+test_cases/
 
 # Local engine binaries, models and runtime logs
 /katago/

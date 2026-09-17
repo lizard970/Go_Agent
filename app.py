@@ -8,7 +8,7 @@ apply_shell()
 
 pages = [
     st.Page("app_pages/home.py", title="首页", icon=":material/home:", default=True),
-    st.Page("app_pages/review.py", title="新建复盘 / SGF复盘", icon=":material/add_circle:"),
+    st.Page("app_pages/review.py", title="分析工作台", icon=":material/add_circle:"),
     st.Page("app_pages/mistakes.py", title="错题本", icon=":material/library_books:"),
     st.Page("app_pages/dashboard.py", title="成长看板", icon=":material/monitoring:"),
 ]

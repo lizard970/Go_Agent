@@ -13,10 +13,11 @@ load_dotenv()
 @lru_cache(maxsize=1)
 def get_client():
     """Create the LLM client only when an LLM feature is used."""
-    return OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        http_client=httpx.Client(proxy="http://127.0.0.1:9567"),
-    )
+    proxy = os.getenv("OPENAI_PROXY")
+    kwargs = {"api_key": os.getenv("OPENAI_API_KEY")}
+    if proxy:
+        kwargs["http_client"] = httpx.Client(proxy=proxy)
+    return OpenAI(**kwargs)
 
 
 GPT_MODEL = "gpt-5.6"

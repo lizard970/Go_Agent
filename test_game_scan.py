@@ -43,6 +43,18 @@ def test_twenty_move_scan_uses_exactly_n_plus_one_aligned_calls():
     assert result.moves[0].warnings == ['warning-0', 'warning-1']
 
 
+def test_scan_reports_lightweight_position_progress():
+    progress = []
+    scan_game(
+        parse_sgf(TWENTY_MOVE_SGF),
+        Mock(analyze=Mock(side_effect=analysis_for)),
+        progress_callback=progress.append,
+    )
+    assert len(progress) == 21
+    assert progress[0] == "KataGo 正在分析第 1 / 21 个局面…"
+    assert progress[-1] == "KataGo 正在分析第 21 / 21 个局面…"
+
+
 def test_actual_moves_pass_and_player_perspective_losses():
     result = scan_game(parse_sgf(TWENTY_MOVE_SGF), Mock(analyze=Mock(side_effect=analysis_for)))
     black_move = result.moves[0]

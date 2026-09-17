@@ -6,6 +6,7 @@ import io
 import json
 
 import matplotlib.pyplot as plt
+import altair as alt
 import streamlit as st
 from PIL import Image
 
@@ -16,6 +17,7 @@ from game_scan import (GameScanError, metrics_for_color, scan_game,
 from katago_adapter import (KataGoProcessError, LocalKataGoAdapter,
                             PersistentKataGoAdapter)
 from memory_store import find_most_similar, load_history, save_record
+from move_commentary import importance_timeline_data
 from sgf_ingestion import parse_sgf
 from ui import STATE_CYCLE, STATE_LABEL, draw_board
 
@@ -72,7 +74,170 @@ def render_katago_result(result, user_color):
         st.json(asdict(result))
 
 
+def render_agent_player(run):
+    game = run.game
+    state = run.result.state
+    scan = state.scan_result
+    if scan is None or not state.move_importance:
+        st.info("当前 Agent 结果不是整盘复盘，尚无可播放的全盘缓存。")
+        return
+    key = f"workspace_agent_move_{state.game_id}"
+    st.session_state.setdefault(key, 1)
+    st.session_state[key] = max(1, min(len(game.moves), st.session_state[key]))
+    current = st.session_state[key]
+
+    move = scan.moves[current - 1]
+    importance = state.move_importance[current - 1]
+    rows = importance_timeline_data(state.move_importance, current)
+    base = alt.Chart(alt.Data(values=rows)).encode(
+        x=alt.X("move_number:Q", title="手数"),
+        y=alt.Y("importance_score:Q", title="重要度", scale=alt.Scale(domain=[0, 1])),
+    )
+    line = base.mark_area(opacity=.22, color="#8f4b58", line=True)
+    points = base.mark_circle(size=38).encode(
+        color=alt.Color(
+            "polarity:N", title="关注方向",
+            scale=alt.Scale(domain=["negative", "positive", "neutral"],
+                            range=["#9d4055", "#5f7d5f", "#9a8d84"]),
+        ),
+        tooltip=["move_number:Q", "importance_score:Q", "commentary_level:N"],
+    )
+    cursor = alt.Chart(alt.Data(values=[{"move_number": current}])).mark_rule(
+        color="#33282d", strokeWidth=2
+    ).encode(x="move_number:Q")
+    st.markdown("""<style>
+    .st-key-workspace_timeline {opacity:.48; transition:opacity .18s ease;}
+    .st-key-workspace_timeline:hover {opacity:1;}
+    </style>""", unsafe_allow_html=True)
+
+    def step_move(delta):
+        st.session_state[key] = max(
+            1, min(len(game.moves), st.session_state[key] + delta)
+        )
+
+    board_col, detail_col = st.columns([1.18, .82], gap="medium")
+    with board_col:
+        with st.container(border=True):
+            st.subheader(f"第 {current} 手后的局面")
+            fig = draw_board(game.size, game.position(current).board_data["stones"])
+            st.pyplot(fig, width="stretch")
+            plt.close(fig)
+        with st.container(key="workspace_timeline"):
+            st.altair_chart(line + points + cursor, width="stretch")
+    with detail_col:
+        with st.container(border=True):
+            marker = " · Top 错误" if importance.is_top_error else ""
+            st.subheader(f"第 {current} 手 · {'黑棋' if move.player == 'B' else '白棋'}{marker}")
+            user_before = metrics_for_color(move.black_winrate_before, move.black_score_lead_before, move.player)
+            user_after = metrics_for_color(move.black_winrate_after, move.black_score_lead_after, move.player)
+            one, two, three = st.columns(3)
+            one.metric("实战", move.actual_move)
+            two.metric("推荐", move.best_move_before)
+            three.metric("重要度", f"{importance.importance_score:.0%}")
+            st.caption(
+                f"行棋方胜率 {user_before[0]:.1%} → {user_after[0]:.1%} · "
+                f"目差 {user_before[1]:+.1f} → {user_after[1]:+.1f} · {move.phase}"
+            )
+            comment = state.move_comments.get(current)
+            if comment is not None and comment.status == "succeeded":
+                st.markdown(f"**{comment.headline}**\n\n{comment.commentary}")
+            elif importance.commentary_level == "quiet":
+                st.caption("这一手没有发现值得单独展开的问题。")
+            else:
+                st.warning("这一手值得关注，但批量点评暂不可用；KataGo 证据已保留。")
+
+            for signal in state.history_summary.get("repeated_error_candidates", []):
+                index = signal.get("evidence_index")
+                if index is not None and index < len(state.deep_evidence) and state.deep_evidence[index].worst_move_number == current:
+                    st.info(
+                        f"找到 {signal['candidate_count']} 条潜在相似历史记录；"
+                        "相似度不代表已经确认是同一种错误。"
+                    )
+        st.container(height=56, border=False)
+        with st.container(border=True, key="workspace_player_controls"):
+            st.caption(f"复盘进度 · 第 {current} / {len(game.moves)} 手")
+            previous, slider_col, next_col = st.columns([.24, .52, .24], vertical_alignment="bottom")
+            previous.button(
+                "上一手", key="workspace_previous", disabled=current <= 1,
+                width="stretch", on_click=step_move, args=(-1,),
+            )
+            slider_col.slider(
+                "手数", 1, len(game.moves), key=key,
+                label_visibility="collapsed",
+            )
+            next_col.button(
+                "下一手", key="workspace_next", disabled=current >= len(game.moves),
+                width="stretch", on_click=step_move, args=(1,),
+            )
+
+
+def render_saved_mistake(context):
+    source = context["source_content"]
+    game = parse_sgf(source if isinstance(source, bytes) else source.encode("utf-8"))
+    move_number = context["worst_move_number"]
+    snapshot = context.get("board_snapshot")
+    board_data = None
+    if snapshot is not None:
+        board_data = {
+            "board_size": snapshot["board_size"],
+            "stones": [
+                {"x": point[0], "y": point[1], "color": color}
+                for color in ("black", "white")
+                for point in snapshot.get(color, [])
+            ],
+        }
+    if board_data is None:
+        board_data = game.position(move_number).board_data
+    board, detail = st.columns([1.18, .82], gap="medium")
+    with board.container(border=True):
+        st.subheader(f"第 {move_number} 手后的历史局面")
+        fig = draw_board(game.size, board_data["stones"])
+        st.pyplot(fig, width="stretch")
+        plt.close(fig)
+    with detail.container(border=True):
+        st.subheader(context.get("title") or f"第 {move_number} 手")
+        st.caption(
+            f"实战 {context['actual_move']} · 推荐 {context['recommended_move']} · "
+            f"胜率损失 {context['player_winrate_loss']:.1%} · "
+            f"目差损失 {context['player_score_loss']:.1f}"
+        )
+        st.write(context.get("summary") or "解释尚未完成。")
+        if context.get("why_it_matters"):
+            st.write(f"为什么重要：{context['why_it_matters']}")
+        if context.get("better_plan"):
+            st.write(f"更好的思路：{context['better_plan']}")
+        if context.get("learning_point"):
+            st.write(f"复用要点：{context['learning_point']}")
+    st.caption("此历史局面从本地 SGF 与保存快照恢复，未调用 KataGo 或 OpenAI。")
+
+
 def render_sgf():
+    cached = st.session_state.get("agent_home_review_run")
+    mistake_context = st.session_state.get("workspace_mistake_context")
+    ignore_cached = st.session_state.get("workspace_ignore_agent_cache", False)
+    has_full_player_cache = (
+        cached is not None
+        and cached.result.state.scan_result is not None
+        and cached.result.state.move_importance
+    )
+    if has_full_player_cache and not ignore_cached:
+        st.subheader("整盘逐手复盘")
+        render_agent_player(cached)
+        if st.button("切换到手动分析", key="workspace_manual_mode"):
+            st.session_state["workspace_ignore_agent_cache"] = True
+            st.rerun()
+        return
+    if mistake_context is not None and not has_full_player_cache:
+        st.subheader("历史错题局面")
+        render_saved_mistake(mistake_context)
+        if st.button("切换到手动分析", key="workspace_saved_manual_mode"):
+            st.session_state.pop("workspace_mistake_context", None)
+            st.rerun()
+        return
+    if has_full_player_cache and ignore_cached:
+        if st.button("返回 Agent 逐手复盘", key="workspace_agent_mode"):
+            st.session_state["workspace_ignore_agent_cache"] = False
+            st.rerun()
     upload_col, move_col, color_col = st.columns([1.15, .75, .55], gap="medium", vertical_alignment="bottom")
     with upload_col:
         uploaded = st.file_uploader("上传 SGF 棋谱", type=["sgf"], key="sgf_upload")
